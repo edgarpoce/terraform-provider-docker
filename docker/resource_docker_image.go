@@ -15,6 +15,7 @@ func resourceDockerImage() *schema.Resource {
 			"name": {
 				Type:     schema.TypeString,
 				Required: true,
+				ForceNew: true,
 			},
 
 			"latest": {
@@ -41,6 +42,38 @@ func resourceDockerImage() *schema.Resource {
 				ForceNew: true,
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
+			},
+			"build": &schema.Schema{
+				Type:          schema.TypeSet,
+				Optional:      true,
+				MaxItems:      1,
+				ConflictsWith: []string{"pull_triggers", "pull_trigger"},
+				ForceNew:      true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"context": &schema.Schema{
+							Type:     schema.TypeString,
+							Required: true,
+							ForceNew: true,
+						},
+						"dockerfile": &schema.Schema{
+							Type:     schema.TypeString,
+							Optional: true,
+							Default:  "Dockerfile",
+							ForceNew: true,
+						},
+						"buildargs": &schema.Schema{
+							Type:     schema.TypeMap,
+							Optional: true,
+							Elem:     schema.TypeString,
+							ForceNew: true,
+						},
+						"context_tar_hash": &schema.Schema{
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+					},
+				},
 			},
 		},
 	}

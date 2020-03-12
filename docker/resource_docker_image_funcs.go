@@ -1,29 +1,53 @@
 package docker
 
 import (
+	"archive/tar"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/docker/docker/pkg/term"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 )
+
+func getBuildConfig(d *schema.ResourceData) map[string]interface{} {
+	return d.Get("build").(*schema.Set).List()[0].(map[string]interface{})
+}
+
+func isBuilt(d *schema.ResourceData) bool {
+	return len(d.Get("build").(*schema.Set).List()) > 0
+}
 
 func resourceDockerImageCreate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*ProviderConfig).DockerClient
 	imageName := d.Get("name").(string)
+	if isBuilt(d) {
+		buildConfig := getBuildConfig(d)
+		contextTarHash, err := buildDockerImage(client, imageName, buildConfig)
+		if err != nil {
+			return fmt.Errorf("Unable to build Docker image : %s", err)
+		}
+		buildConfig["context_tar_hash"] = contextTarHash
+	}
 	apiImage, err := findImage(imageName, client, meta.(*ProviderConfig).AuthConfigs)
 	if err != nil {
 		return fmt.Errorf("Unable to read Docker image into resource: %s", err)
 	}
-
-	d.SetId(apiImage.ID + d.Get("name").(string))
+	d.SetId(apiImage.ID + "/" + imageName)
 	return resourceDockerImageRead(d, meta)
 }
 
@@ -41,6 +65,23 @@ func resourceDockerImageRead(d *schema.ResourceData, meta interface{}) error {
 	if foundImage == nil {
 		d.SetId("")
 		return nil
+	}
+
+	// if it's build then check the contexthash
+	if isBuilt(d) {
+		buildOptions := getBuildConfig(d)
+		dockerContextTarPath, err := buildContextTar(buildOptions["context"].(string))
+		if err != nil {
+			return err
+		}
+		defer os.Remove(dockerContextTarPath)
+		contextHash, err := getDockerContextTarHash(dockerContextTarPath)
+		if err != nil {
+			return err
+		}
+		if contextHash != buildOptions["context_tar_hash"] {
+			d.Set("build", nil)
+		}
 	}
 
 	d.SetId(foundImage.ID + d.Get("name").(string))
@@ -217,6 +258,7 @@ func parseImageOptions(image string) internalPullImageOptions {
 }
 
 func findImage(imageName string, client *client.Client, authConfig *AuthConfigs) (*types.ImageSummary, error) {
+	log.Printf("[DEBUG] Finding Docker image: %s", imageName)
 	if imageName == "" {
 		return nil, fmt.Errorf("Empty image name is not allowed")
 	}
@@ -247,4 +289,125 @@ func findImage(imageName string, client *client.Client, authConfig *AuthConfigs)
 	}
 
 	return nil, fmt.Errorf("Unable to find or pull image %s", imageName)
+}
+
+func buildContextTar(buildContext string) (string, error) {
+	// Create our Temp File:  This will create a filename like /tmp/terraform-provider-docker-123456.tar
+	tmpFile, err := ioutil.TempFile(os.TempDir(), "terraform-provider-docker-*.tar")
+	if err != nil {
+		return "", fmt.Errorf("Cannot create temporary file - %v", err.Error())
+	}
+
+	defer tmpFile.Close()
+
+	if _, err = os.Stat(buildContext); err != nil {
+		return "", fmt.Errorf("Unable to read build context - %v", err.Error())
+	}
+
+	tw := tar.NewWriter(tmpFile)
+	defer tw.Close()
+
+	err = filepath.Walk(buildContext, func(file string, info os.FileInfo, err error) error {
+
+		// return on any error
+		if err != nil {
+			return err
+		}
+
+		// create a new dir/file header
+		header, err := tar.FileInfoHeader(info, info.Name())
+		if err != nil {
+			return err
+		}
+
+		// update the name to correctly reflect the desired destination when untaring
+		header.Name = strings.TrimPrefix(strings.Replace(file, buildContext, "", -1), string(filepath.Separator))
+
+		// write the header
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		// return on non-regular files (thanks to [kumo](https://medium.com/@komuw/just-like-you-did-fbdd7df829d3) for this suggested update)
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+
+		// open files for taring
+		f, err := os.Open(file)
+		if err != nil {
+			return err
+		}
+
+		// copy file data into tar writer
+		if _, err := io.Copy(tw, f); err != nil {
+			return err
+		}
+
+		// manually close here after each file operation; defering would cause each file close
+		// to wait until all operations have completed.
+		f.Close()
+
+		return nil
+
+	})
+
+	return tmpFile.Name(), nil
+}
+
+func getDockerContextTarHash(dockerContextTarPath string) (string, error) {
+	hasher := sha256.New()
+	s, err := ioutil.ReadFile(dockerContextTarPath)
+	if err != nil {
+		return "", err
+	}
+	hasher.Write(s)
+	contextHash := hex.EncodeToString(hasher.Sum(nil))
+	return contextHash, nil
+}
+
+func buildDockerImage(client *client.Client, tag string, buildOptions map[string]interface{}) (string, error) {
+	log.Printf("[DEBUG] Building docker image: %s", tag)
+	dockerContextTarPath, err := buildContextTar(buildOptions["context"].(string))
+	defer os.Remove(dockerContextTarPath)
+
+	contextHash, err := getDockerContextTarHash(dockerContextTarPath)
+	if err != nil {
+		return "", err
+	}
+
+	dockerBuildContext, err := os.Open(dockerContextTarPath)
+	defer dockerBuildContext.Close()
+
+	options := types.ImageBuildOptions{
+		SuppressOutput: false,
+		Remove:         true,
+		ForceRemove:    true,
+		PullParent:     true,
+		Tags:           []string{tag},
+		Dockerfile:     buildOptions["dockerfile"].(string),
+		BuildArgs:      mapTypeMapValsToStringPtr(buildOptions["buildargs"].(map[string]interface{})),
+	}
+
+	buildResponse, err := client.ImageBuild(context.Background(), dockerBuildContext, options)
+	if err != nil {
+		return "", err
+	}
+	defer buildResponse.Body.Close()
+
+	termFd, isTerm := term.GetFdInfo(os.Stderr)
+	err = jsonmessage.DisplayJSONMessagesStream(buildResponse.Body, os.Stderr, termFd, isTerm, nil)
+	if err != nil {
+		return "", err
+	}
+
+	return contextHash, nil
+}
+
+func mapTypeMapValsToStringPtr(typeMap map[string]interface{}) map[string]*string {
+	mapped := make(map[string]*string, len(typeMap))
+	for k, v := range typeMap {
+		*mapped[k] = v.(string)
+	}
+	return mapped
 }
