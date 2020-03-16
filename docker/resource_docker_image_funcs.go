@@ -28,14 +28,14 @@ func getBuildConfig(d *schema.ResourceData) map[string]interface{} {
 	return d.Get("build").(*schema.Set).List()[0].(map[string]interface{})
 }
 
-func isBuilt(d *schema.ResourceData) bool {
+func isBuildEnabled(d *schema.ResourceData) bool {
 	return len(d.Get("build").(*schema.Set).List()) > 0
 }
 
 func resourceDockerImageCreate(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*ProviderConfig).DockerClient
 	imageName := d.Get("name").(string)
-	if isBuilt(d) {
+	if isBuildEnabled(d) {
 		buildConfig := getBuildConfig(d)
 		contextTarHash, err := buildDockerImage(client, imageName, buildConfig)
 		if err != nil {
@@ -48,6 +48,7 @@ func resourceDockerImageCreate(d *schema.ResourceData, meta interface{}) error {
 		return fmt.Errorf("Unable to read Docker image into resource: %s", err)
 	}
 	d.SetId(apiImage.ID + "/" + imageName)
+	d.Set("image_id", apiImage.ID)
 	return resourceDockerImageRead(d, meta)
 }
 
@@ -67,8 +68,7 @@ func resourceDockerImageRead(d *schema.ResourceData, meta interface{}) error {
 		return nil
 	}
 
-	// if it's build then check the contexthash
-	if isBuilt(d) {
+	if isBuildEnabled(d) {
 		buildOptions := getBuildConfig(d)
 		dockerContextTarPath, err := buildContextTar(buildOptions["context"].(string))
 		if err != nil {

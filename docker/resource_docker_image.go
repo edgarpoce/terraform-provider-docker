@@ -17,7 +17,10 @@ func resourceDockerImage() *schema.Resource {
 				Required: true,
 				ForceNew: true,
 			},
-
+			"image_id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 			"latest": {
 				Type:     schema.TypeString,
 				Computed: true,
@@ -43,6 +46,7 @@ func resourceDockerImage() *schema.Resource {
 				Elem:     &schema.Schema{Type: schema.TypeString},
 				Set:      schema.HashString,
 			},
+
 			"build": &schema.Schema{
 				Type:          schema.TypeSet,
 				Optional:      true,
